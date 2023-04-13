@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 	"github.com/rs/xid"
 )
+
+const retryTime = 10 * time.Millisecond
 
 func main() {
 	n := maelstrom.NewNode()
@@ -16,22 +20,13 @@ func main() {
 	msgStore := &sync.Map{}
 	topoStore := &topology{
 		Mutex:      &sync.Mutex{},
-		Neighbours: make([]string, 0),
-	}
-
-	// defaulting to all the nodes as neighbours
-	for _, neighbour := range n.NodeIDs() {
-		if neighbour == n.ID() {
-			continue
-		}
-
-		topoStore.Neighbours = append(topoStore.Neighbours, neighbour)
+		Neighbours: make(map[string]*chan *broadcastMsg, 0),
 	}
 
 	n.Handle("echo", echoHandler(n))
 	n.Handle("generate", generateHandler(n))
 	n.Handle("broadcast", broadcastHandler(n, topoStore, msgStore))
-	n.Handle("broadcast_ok", func(msg maelstrom.Message) error { return nil })
+	n.Handle("broadcast_ok", broadcastOkHandler())
 	n.Handle("read", readHandler(n, msgStore))
 	n.Handle("topology", topologyHandler(n, topoStore))
 
@@ -42,7 +37,7 @@ func main() {
 
 type topology struct {
 	*sync.Mutex
-	Neighbours []string
+	Neighbours map[string]*chan *broadcastMsg
 }
 
 func echoHandler(n *maelstrom.Node) maelstrom.HandlerFunc {
@@ -76,7 +71,11 @@ type broadcastMsg struct {
 	Message int    `json:"message"`
 }
 
-func broadcastHandler(n *maelstrom.Node, topoStore *topology, msgstore *sync.Map) maelstrom.HandlerFunc {
+func broadcastHandler(
+	n *maelstrom.Node,
+	topoStore *topology,
+	msgstore *sync.Map,
+) maelstrom.HandlerFunc {
 	return func(msg maelstrom.Message) error {
 		// Unmarshal the message body as an loosely-typed map.
 		var payload broadcastMsg
@@ -90,10 +89,7 @@ func broadcastHandler(n *maelstrom.Node, topoStore *topology, msgstore *sync.Map
 			return nil
 		}
 
-		// broadcast the message to all the neighbours
-		if err := broadcast(n, topoStore, &payload); err != nil {
-			return err
-		}
+		broadcast(topoStore, &payload)
 
 		// Echo the original message back with the updated message type.
 		return n.Reply(msg, map[string]any{
@@ -102,17 +98,16 @@ func broadcastHandler(n *maelstrom.Node, topoStore *topology, msgstore *sync.Map
 	}
 }
 
-func broadcast(n *maelstrom.Node, topoStore *topology, msg *broadcastMsg) error {
+func broadcast(
+	topoStore *topology,
+	msg *broadcastMsg,
+) {
 	topoStore.Lock()
 	defer topoStore.Unlock()
 
 	for _, neighbour := range topoStore.Neighbours {
-		if err := n.Send(neighbour, msg); err != nil {
-			return err
-		}
+		*neighbour <- msg
 	}
-
-	return nil
 }
 
 func readHandler(n *maelstrom.Node, store *sync.Map) maelstrom.HandlerFunc {
@@ -152,15 +147,67 @@ func topologyHandler(n *maelstrom.Node, topoStore *topology) maelstrom.HandlerFu
 			return err
 		}
 
-		neighbours, ok := payload.Topology[n.ID()]
+		// neighbours, ok := payload.Topology[n.ID()]
+		ok := true
+		neighbours := n.NodeIDs()
+
 		if ok {
 			topoStore.Lock()
-			topoStore.Neighbours = neighbours
+
+			for _, neighbour := range neighbours {
+				if neighbour == n.ID() {
+					continue
+				}
+
+				// if it already exists, skip
+				if _, ok := topoStore.Neighbours[neighbour]; ok {
+					continue
+				}
+
+				const maxMsgQ = 1000
+				msgC := make(chan *broadcastMsg, maxMsgQ)
+
+				// launch a goroutine to handle the broadcast
+				go func(neighbour string) {
+					log.Printf("launching go routine for node %s", neighbour)
+
+					for {
+						msg := <-msgC
+						log.Printf("received message %d to send to %s", msg.Message, neighbour)
+
+						const reqTimeout = 100 * time.Millisecond
+						ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
+
+						if _, err := n.SyncRPC(ctx, neighbour, msg); err != nil {
+							cancel()
+							log.Printf("error sending broadcast message %d to %s: %v", msg.Message, neighbour, err)
+							// requeue msg
+							msgC <- msg
+
+							log.Printf("error sending broadcast message %d to %s: %v", msg.Message, neighbour, err)
+							time.Sleep(retryTime)
+
+							continue
+						}
+
+						log.Printf("successfully sent message %d to %s", msg.Message, neighbour)
+					}
+				}(neighbour)
+
+				topoStore.Neighbours[neighbour] = &msgC
+			}
+
 			topoStore.Unlock()
 		}
 
 		return n.Reply(msg, map[string]any{
 			"type": "topology_ok",
 		})
+	}
+}
+
+func broadcastOkHandler() maelstrom.HandlerFunc {
+	return func(msg maelstrom.Message) error {
+		return nil
 	}
 }
