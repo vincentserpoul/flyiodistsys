@@ -11,17 +11,14 @@ import (
 	"github.com/rs/xid"
 )
 
-const retryTime = 10 * time.Millisecond
+// const retryTime = 5 * time.Millisecond
 
 func main() {
 	n := maelstrom.NewNode()
 
 	// init
 	msgStore := &sync.Map{}
-	topoStore := &topology{
-		Mutex:      &sync.Mutex{},
-		Neighbours: make(map[string]*chan *broadcastMsg, 0),
-	}
+	topoStore := make(map[string]*chan *broadcastMsg, 0)
 
 	n.Handle("echo", echoHandler(n))
 	n.Handle("generate", generateHandler(n))
@@ -33,11 +30,6 @@ func main() {
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
 	}
-}
-
-type topology struct {
-	*sync.Mutex
-	Neighbours map[string]*chan *broadcastMsg
 }
 
 func echoHandler(n *maelstrom.Node) maelstrom.HandlerFunc {
@@ -73,7 +65,7 @@ type broadcastMsg struct {
 
 func broadcastHandler(
 	n *maelstrom.Node,
-	topoStore *topology,
+	topoStore map[string]*chan *broadcastMsg,
 	msgstore *sync.Map,
 ) maelstrom.HandlerFunc {
 	return func(msg maelstrom.Message) error {
@@ -99,14 +91,11 @@ func broadcastHandler(
 }
 
 func broadcast(
-	topoStore *topology,
+	topoStore map[string]*chan *broadcastMsg,
 	msg *broadcastMsg,
 ) {
-	topoStore.Lock()
-	defer topoStore.Unlock()
-
-	for _, neighbour := range topoStore.Neighbours {
-		*neighbour <- msg
+	for _, neightbourChan := range topoStore {
+		*neightbourChan <- msg
 	}
 }
 
@@ -134,11 +123,63 @@ func readHandler(n *maelstrom.Node, store *sync.Map) maelstrom.HandlerFunc {
 	}
 }
 
-func topologyHandler(n *maelstrom.Node, topoStore *topology) maelstrom.HandlerFunc {
+func updateTopology(n *maelstrom.Node, topoStore map[string]*chan *broadcastMsg, neighbours []string) {
+	for _, neighbour := range neighbours {
+		if neighbour == n.ID() {
+			continue
+		}
+
+		// if it already exists, skip
+		if _, ok := topoStore[neighbour]; ok {
+			continue
+		}
+
+		const maxMsgQ = 10000
+		msgC := make(chan *broadcastMsg, maxMsgQ)
+
+		// launch a goroutine to handle the broadcast
+		go func(neighbour string) {
+			for msg := range msgC {
+				msg := msg
+				go func() {
+					const reqTimeout = 120 * time.Millisecond
+
+					ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
+					defer cancel()
+
+					if _, err := n.SyncRPC(ctx, neighbour, msg); err != nil {
+						// log.Printf("error sending broadcast message %d to %s: %v", msg.Message, neighbour, err)
+						// requeue msg
+						msgC <- msg
+					}
+				}()
+			}
+		}(neighbour)
+
+		topoStore[neighbour] = &msgC
+	}
+}
+
+func topologyHandler(n *maelstrom.Node, topoStore map[string]*chan *broadcastMsg) maelstrom.HandlerFunc {
 	type topologyMsg struct {
 		Type     string              `json:"type"`
 		Topology map[string][]string `json:"topology"`
 	}
+
+	topoChan := make(chan *topologyMsg)
+
+	go func() {
+		for payload := range topoChan {
+			neighbours, ok := payload.Topology[n.ID()]
+			// for range topoChan {
+			// 	ok := true
+			// 	neighbours := n.NodeIDs()
+
+			if ok {
+				updateTopology(n, topoStore, neighbours)
+			}
+		}
+	}()
 
 	return func(msg maelstrom.Message) error {
 		// Unmarshal the message body as an loosely-typed map.
@@ -147,58 +188,7 @@ func topologyHandler(n *maelstrom.Node, topoStore *topology) maelstrom.HandlerFu
 			return err
 		}
 
-		// neighbours, ok := payload.Topology[n.ID()]
-		ok := true
-		neighbours := n.NodeIDs()
-
-		if ok {
-			topoStore.Lock()
-
-			for _, neighbour := range neighbours {
-				if neighbour == n.ID() {
-					continue
-				}
-
-				// if it already exists, skip
-				if _, ok := topoStore.Neighbours[neighbour]; ok {
-					continue
-				}
-
-				const maxMsgQ = 1000
-				msgC := make(chan *broadcastMsg, maxMsgQ)
-
-				// launch a goroutine to handle the broadcast
-				go func(neighbour string) {
-					log.Printf("launching go routine for node %s", neighbour)
-
-					for {
-						msg := <-msgC
-						log.Printf("received message %d to send to %s", msg.Message, neighbour)
-
-						const reqTimeout = 100 * time.Millisecond
-						ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
-
-						if _, err := n.SyncRPC(ctx, neighbour, msg); err != nil {
-							cancel()
-							log.Printf("error sending broadcast message %d to %s: %v", msg.Message, neighbour, err)
-							// requeue msg
-							msgC <- msg
-
-							log.Printf("error sending broadcast message %d to %s: %v", msg.Message, neighbour, err)
-							time.Sleep(retryTime)
-
-							continue
-						}
-
-						log.Printf("successfully sent message %d to %s", msg.Message, neighbour)
-					}
-				}(neighbour)
-
-				topoStore.Neighbours[neighbour] = &msgC
-			}
-
-			topoStore.Unlock()
-		}
+		topoChan <- &payload
 
 		return n.Reply(msg, map[string]any{
 			"type": "topology_ok",
