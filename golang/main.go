@@ -11,6 +11,8 @@ import (
 	"github.com/rs/xid"
 )
 
+// SWITCH TO ACTORS
+
 // const retryTime = 5 * time.Millisecond
 
 func main() {
@@ -124,6 +126,20 @@ func readHandler(n *maelstrom.Node, store *sync.Map) maelstrom.HandlerFunc {
 }
 
 func updateTopology(n *maelstrom.Node, topoStore map[string]*chan *broadcastMsg, neighbours []string) {
+	// find which neighbours shd be deleted
+	newNeighbours := make(map[string]struct{})
+	for _, neighbour := range neighbours {
+		newNeighbours[neighbour] = struct{}{}
+	}
+
+	for neighbour, msgC := range topoStore {
+		if _, ok := newNeighbours[neighbour]; !ok {
+			// delete the channel
+			close(*msgC)
+			delete(topoStore, neighbour)
+		}
+	}
+
 	for _, neighbour := range neighbours {
 		if neighbour == n.ID() {
 			continue
@@ -142,7 +158,7 @@ func updateTopology(n *maelstrom.Node, topoStore map[string]*chan *broadcastMsg,
 			for msg := range msgC {
 				msg := msg
 				go func() {
-					const reqTimeout = 120 * time.Millisecond
+					const reqTimeout = 150 * time.Millisecond
 
 					ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
 					defer cancel()
